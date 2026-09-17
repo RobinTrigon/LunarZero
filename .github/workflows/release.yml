@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   target: aarch64-apple-darwin,       archive: tar.gz }
+          # Intel macOS is cross-compiled on Apple Silicon (no Intel runners left)
+          - { os: macos-latest,   target: x86_64-apple-darwin,        archive: tar.gz }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,   archive: tar.gz }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,     archive: zip }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p lz-cli --target ${{ matrix.target }}
+      - name: package
+        shell: bash
+        run: |
+          set -e
+          v="${GITHUB_REF_NAME}"
+          dir="lunarzero-${v}-${{ matrix.target }}"
+          mkdir -p "$dir"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "target/${{ matrix.target }}/release/lz.exe" "$dir/"
+            cp README.md LICENSE NOTICE.md "$dir/"
+            7z a "$dir.zip" "$dir" > /dev/null
+          else
+            cp "target/${{ matrix.target }}/release/lz" "$dir/"
+            ln -s lz "$dir/lunarzero"
+            cp README.md LICENSE NOTICE.md "$dir/"
+            tar czf "$dir.tar.gz" "$dir"
+          fi
+          ls -la "$dir".*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: lunarzero-*.${{ matrix.archive }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: release notes
+        run: |
+          # the section of CHANGELOG.md for this tag, else a stub
+          awk -v tag="${GITHUB_REF_NAME#v}" '
+            /^## / { on = index($0, tag) > 0 || index($0, "Unreleased") > 0 }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "LunarZero ${GITHUB_REF_NAME}" > notes.md
+          printf '\n---\nInstall: unpack the archive for your platform and put `lz` on your PATH, or `cargo install --git https://github.com/RobinTrigon/LunarZero lz-cli --tag %s`.\n' "$GITHUB_REF_NAME" >> notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            dist/*

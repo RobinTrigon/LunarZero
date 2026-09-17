@@ -1,0 +1,1 @@
+Ask the user and wait. Each question: short header, 2–4 options with one-line descriptions, `multiple` if several may apply; the user can also type their own answer. Only when the answer changes what you will do.

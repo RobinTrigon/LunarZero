@@ -1,0 +1,1 @@
+Run a shell command in the project and return its output. For build/test/git/package commands, not for reading or editing files. Chain dependent commands with `&&`; keep unrelated ones separate so they run in parallel. Output is truncated past a limit; default timeout 2 min. Avoid interactive commands; no destructive git unless asked.

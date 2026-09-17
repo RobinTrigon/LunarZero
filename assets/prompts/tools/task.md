@@ -1,0 +1,1 @@
+Delegate a self-contained task to a sub-agent with its own session; it sees only `prompt`, so include everything and say what to return. Not for what one read/grep would answer. `task_id` resumes an earlier sub-agent.

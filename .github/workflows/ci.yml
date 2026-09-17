@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # weekly advisory sweep
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --release -p lz-cli
+      - name: smoke
+        run: |
+          ./target/release/lz --version
+          ./target/release/lz config schema > /dev/null
+          LZ_AUTH_CONTENT='{}' ./target/release/lz pool list | head -3
+
+  windows:
+    name: windows (build, tests, agent smoke run)
+    needs: lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+      - name: agent turn in PowerShell against the mock provider
+        shell: pwsh
+        run: |
+          $mock = Start-Process -FilePath python -ArgumentList "scripts/mock_provider.py" -PassThru -NoNewWindow
+          Start-Sleep -Seconds 2
+          $work = Join-Path $env:RUNNER_TEMP "lzwin"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          $env:LZ_AUTH_CONTENT = '{}'
+          $env:LZ_DISABLE_MODELS_FETCH = '1'
+          $env:LZ_WEB = '0'
+          $env:LZ_CONFIG_CONTENT = '{"provider":{"mock":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://127.0.0.1:18080/v1","apiKey":"x"},"models":{"m1":{"name":"m1"}}}},"model":"mock/m1","pool":{"enabled":false},"permission":{"*":"allow"}}'
+          Push-Location $work
+          $out = & "$env:GITHUB_WORKSPACE\target\debug\lz.exe" run --auto --model mock/m1 "scenario1 go" 2>&1 | Out-String
+          Pop-Location
+          Stop-Process -Id $mock.Id -Force
+          Write-Host $out
+          if ($out -notmatch "hello lunar") { throw "bash tool did not run in PowerShell" }
+          if ($out -notmatch "All done") { throw "turn did not complete" }
+          if ((Get-Content (Join-Path $work "hello.txt") -Raw) -notmatch "hello lunar") { throw "edit tool did not write" }
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      # the crates.io yanked-check times out now and then; that is not an advisory
+      - run: for i in 1 2 3; do cargo audit && break || sleep 20; done

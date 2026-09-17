@@ -1,0 +1,834 @@
+//! Symbol index built with tree-sitter: definitions (functions, types,
+//! classes, …) and which files reference them, for Rust, Python,
+//! JavaScript/TypeScript and Go.
+//!
+//! Two consumers: the system prompt gets the handful of definitions the
+//! user's message names (`<symbols>`), so the model reads the right file
+//! instead of exploring; and the `symbol` tool answers "where is X defined /
+//! used" without a grep round-trip. Parsing is incremental (mtime + size per
+//! file) and cached under the cache dir, so a 50k-line tree costs well under
+//! a second on first index and milliseconds afterwards.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Instant, SystemTime};
+
+use serde::{Deserialize, Serialize};
+use tree_sitter::{Language, Node, Parser};
+
+const MAX_FILE_BYTES: u64 = 512 * 1024;
+const MAX_FILES: usize = 6_000;
+/// Re-scan the tree for changed files at most this often.
+const REFRESH_SECS: u64 = 5;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Symbol {
+    pub name: String,
+    /// `fn`, `struct`, `enum`, `trait`, `impl`, `type`, `class`, `interface`, `method`, `const`, `mod`
+    pub kind: String,
+    /// worktree-relative path
+    pub file: String,
+    pub line: u32,
+    pub end_line: u32,
+    /// first line of the definition, trimmed
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct FileEntry {
+    mtime: u64,
+    len: u64,
+    symbols: Vec<Symbol>,
+    /// identifiers used in this file (kept only for names defined somewhere)
+    idents: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Snapshot {
+    files: BTreeMap<String, FileEntry>,
+}
+
+#[derive(Default)]
+struct State {
+    snap: Snapshot,
+    /// name → symbols (rebuilt from `snap` after each refresh)
+    by_name: HashMap<String, Vec<Symbol>>,
+    /// name → files referencing it
+    refs: HashMap<String, Vec<String>>,
+    lines: u64,
+    last_scan: Option<Instant>,
+    loaded: bool,
+}
+
+pub struct Index {
+    worktree: PathBuf,
+    cache_file: PathBuf,
+    state: Mutex<State>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    Rust,
+    Python,
+    JavaScript,
+    TypeScript,
+    Tsx,
+    Go,
+    Java,
+    C,
+    Cpp,
+    Ruby,
+}
+
+fn lang_of(path: &Path) -> Option<Lang> {
+    match path.extension()?.to_str()? {
+        "rs" => Some(Lang::Rust),
+        "py" | "pyi" => Some(Lang::Python),
+        "js" | "mjs" | "cjs" | "jsx" => Some(Lang::JavaScript),
+        "ts" | "mts" | "cts" => Some(Lang::TypeScript),
+        "tsx" => Some(Lang::Tsx),
+        "go" => Some(Lang::Go),
+        "java" => Some(Lang::Java),
+        "c" | "h" => Some(Lang::C),
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Some(Lang::Cpp),
+        "rb" | "rake" => Some(Lang::Ruby),
+        _ => None,
+    }
+}
+
+fn language(lang: Lang) -> Language {
+    match lang {
+        Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Lang::Python => tree_sitter_python::LANGUAGE.into(),
+        Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Lang::Go => tree_sitter_go::LANGUAGE.into(),
+        Lang::Java => tree_sitter_java::LANGUAGE.into(),
+        Lang::C => tree_sitter_c::LANGUAGE.into(),
+        Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+    }
+}
+
+/// Node kinds that define a named symbol, with the field holding the name.
+fn definition_kind(lang: Lang, node: &Node) -> Option<(&'static str, &'static str)> {
+    let k = node.kind();
+    let hit = match lang {
+        Lang::Rust => match k {
+            "function_item" | "function_signature_item" => ("fn", "name"),
+            "struct_item" => ("struct", "name"),
+            "enum_item" => ("enum", "name"),
+            "trait_item" => ("trait", "name"),
+            "impl_item" => ("impl", "type"),
+            "type_item" => ("type", "name"),
+            "const_item" => ("const", "name"),
+            "static_item" => ("static", "name"),
+            "mod_item" => ("mod", "name"),
+            "macro_definition" => ("macro", "name"),
+            _ => return None,
+        },
+        Lang::Python => match k {
+            "function_definition" => ("fn", "name"),
+            "class_definition" => ("class", "name"),
+            _ => return None,
+        },
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => match k {
+            "function_declaration" | "generator_function_declaration" => ("fn", "name"),
+            "class_declaration" | "abstract_class_declaration" => ("class", "name"),
+            "method_definition" | "method_signature" => ("method", "name"),
+            "interface_declaration" => ("interface", "name"),
+            "type_alias_declaration" => ("type", "name"),
+            "enum_declaration" => ("enum", "name"),
+            "variable_declarator" => ("const", "name"),
+            _ => return None,
+        },
+        Lang::Go => match k {
+            "function_declaration" => ("fn", "name"),
+            "method_declaration" => ("method", "name"),
+            "type_spec" => ("type", "name"),
+            _ => return None,
+        },
+        Lang::Java => match k {
+            "class_declaration" => ("class", "name"),
+            "interface_declaration" => ("interface", "name"),
+            "enum_declaration" => ("enum", "name"),
+            "record_declaration" => ("class", "name"),
+            "method_declaration" | "constructor_declaration" => ("method", "name"),
+            _ => return None,
+        },
+        Lang::C | Lang::Cpp => match k {
+            "function_definition" => ("fn", "declarator"),
+            "struct_specifier" => ("struct", "name"),
+            "union_specifier" => ("struct", "name"),
+            "enum_specifier" => ("enum", "name"),
+            "class_specifier" => ("class", "name"),
+            "namespace_definition" => ("mod", "name"),
+            "type_definition" => ("type", "declarator"),
+            _ => return None,
+        },
+        Lang::Ruby => match k {
+            "method" | "singleton_method" => ("method", "name"),
+            "class" => ("class", "name"),
+            "module" => ("mod", "name"),
+            _ => return None,
+        },
+    };
+    Some(hit)
+}
+
+/// C/C++ put the name inside a declarator tree (`*name(args)`): dig for it.
+fn declarator_name<'a>(node: &Node, src: &'a [u8]) -> Option<&'a str> {
+    if matches!(
+        node.kind(),
+        "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "qualified_identifier"
+            | "destructor_name"
+            | "operator_name"
+    ) {
+        return Some(node_text(node, src));
+    }
+    if let Some(d) = node.child_by_field_name("declarator") {
+        return declarator_name(&d, src);
+    }
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        if let Some(n) = declarator_name(&child, src) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn is_identifier(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "type_identifier"
+            | "field_identifier"
+            | "property_identifier"
+            | "shorthand_property_identifier"
+            | "constant"
+    )
+}
+
+fn node_text<'a>(node: &Node, src: &'a [u8]) -> &'a str {
+    std::str::from_utf8(&src[node.byte_range()]).unwrap_or("")
+}
+
+fn first_line(text: &str) -> String {
+    let l = text.lines().next().unwrap_or("").trim();
+    // the header only: stop at the body's opening brace
+    let l = l.split_once(" {").map_or(l, |(head, _)| head);
+    let l = l.trim_end_matches('{').trim_end_matches(':').trim();
+    let mut s: String = l.chars().take(160).collect();
+    if l.chars().count() > 160 {
+        s.push('…');
+    }
+    s
+}
+
+/// Parse one file into its definitions and identifier set.
+fn parse_file(lang: Lang, rel: &str, src: &[u8]) -> (Vec<Symbol>, Vec<String>) {
+    let mut parser = Parser::new();
+    if parser.set_language(&language(lang)).is_err() {
+        return (Vec::new(), Vec::new());
+    }
+    let Some(tree) = parser.parse(src, None) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut symbols = Vec::new();
+    let mut idents: HashSet<String> = HashSet::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if is_identifier(node.kind()) {
+            let t = node_text(&node, src);
+            if t.len() >= 3 && t.len() <= 80 {
+                idents.insert(t.to_string());
+            }
+        }
+        if let Some((kind, field)) = definition_kind(lang, &node)
+            && let Some(name_node) = node.child_by_field_name(field)
+        {
+            let name = if field == "declarator" {
+                declarator_name(&name_node, src).unwrap_or("").trim().to_string()
+            } else {
+                node_text(&name_node, src).trim().to_string()
+            };
+            // JS `const x = 1` is noise; keep declarators that hold a function/class
+            let keep = if node.kind() == "variable_declarator" {
+                node.child_by_field_name("value").is_some_and(|v| {
+                    matches!(
+                        v.kind(),
+                        "arrow_function"
+                            | "function_expression"
+                            | "function"
+                            | "class"
+                            | "generator_function"
+                    )
+                })
+            } else {
+                true
+            };
+            if keep && !name.is_empty() && name.len() <= 120 {
+                symbols.push(Symbol {
+                    name,
+                    kind: kind.into(),
+                    file: rel.into(),
+                    line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    signature: first_line(node_text(&node, src)),
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    symbols.sort_by_key(|s| s.line);
+    let mut idents: Vec<String> = idents.into_iter().collect();
+    idents.sort();
+    (symbols, idents)
+}
+
+/// Node kinds whose body is implementation detail: functions and methods.
+/// Types, traits, interfaces, impl blocks and classes keep their members
+/// (only the methods inside lose their bodies).
+fn body_field(lang: Lang, node: &Node) -> Option<&'static str> {
+    let k = node.kind();
+    let field = match lang {
+        Lang::Rust => match k {
+            "function_item" => "body",
+            _ => return None,
+        },
+        Lang::Python => match k {
+            "function_definition" => "body",
+            _ => return None,
+        },
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => match k {
+            "function_declaration"
+            | "generator_function_declaration"
+            | "method_definition"
+            | "arrow_function"
+            | "function_expression"
+            | "function" => "body",
+            _ => return None,
+        },
+        Lang::Go => match k {
+            "function_declaration" | "method_declaration" => "body",
+            "func_literal" => "body",
+            _ => return None,
+        },
+        Lang::Java => match k {
+            "method_declaration" | "constructor_declaration" => "body",
+            _ => return None,
+        },
+        Lang::C | Lang::Cpp => match k {
+            "function_definition" => "body",
+            _ => return None,
+        },
+        Lang::Ruby => match k {
+            "method" | "singleton_method" => "body",
+            _ => return None,
+        },
+    };
+    Some(field)
+}
+
+/// Whether `skeleton` can outline this file.
+pub fn supports(path: &Path) -> bool {
+    lang_of(path).is_some()
+}
+
+/// A file with function bodies replaced by `…` — signatures, type
+/// definitions, fields, trait/interface members and doc comments intact.
+/// Each output line is prefixed with its original line number so the model
+/// can `read` a body with `offset`/`limit` when it needs one.
+pub fn skeleton(path: &Path, src: &str) -> Option<String> {
+    let lang = lang_of(path)?;
+    let mut parser = Parser::new();
+    parser.set_language(&language(lang)).ok()?;
+    let tree = parser.parse(src.as_bytes(), None)?;
+    // outermost bodies only: byte ranges to elide, plus their line span
+    let mut elide: Vec<(usize, usize)> = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if let Some(field) = body_field(lang, &node)
+            && let Some(body) = node.child_by_field_name(field)
+            && body.end_position().row > body.start_position().row
+        {
+            elide.push((body.start_byte(), body.end_byte()));
+            continue; // nested functions are inside the body
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    elide.sort();
+    let bytes = src.as_bytes();
+    let mut out = String::new();
+    let mut pos = 0usize;
+    let mut kept: Vec<u8> = Vec::with_capacity(src.len());
+    for (start, end) in elide {
+        if start < pos {
+            continue;
+        }
+        kept.extend_from_slice(&bytes[pos..start]);
+        let (lines, marker) = if lang == Lang::Python {
+            // the block starts on the line after the colon
+            let rows = src[..start].matches('\n').count();
+            let end_rows = src[..end].matches('\n').count();
+            let n = end_rows - rows + 1;
+            (n.saturating_sub(1), format!("… # {n} lines"))
+        } else {
+            let n = src[start..end].matches('\n').count();
+            (n, format!("{{ … }} // {n} lines"))
+        };
+        // python bodies begin after the colon; others include the braces
+        kept.extend_from_slice(marker.as_bytes());
+        // keep the newline structure: bodies end at a line end; line numbers
+        // for what follows are restored from the original text below
+        kept.push(0u8); // sentinel: line-number jump
+        kept.extend_from_slice(&lines.to_string().into_bytes());
+        kept.push(0u8);
+        pos = end;
+    }
+    kept.extend_from_slice(&bytes[pos..]);
+    // number lines with original positions (the sentinel carries the skipped count)
+    let text = String::from_utf8_lossy(&kept);
+    let mut line_no = 1usize;
+    let mut skip_after_line: usize = 0;
+    for raw in text.split('\n') {
+        let mut line = raw.to_string();
+        if let Some(i) = line.find('\0') {
+            let rest = &line[i + 1..];
+            let j = rest.find('\0').unwrap_or(rest.len());
+            skip_after_line = rest[..j].parse().unwrap_or(0);
+            line = format!("{}{}", &line[..i], &rest[j + 1..]);
+        }
+        out.push_str(&format!("{line_no:>5}\t{line}\n"));
+        line_no += 1 + std::mem::take(&mut skip_after_line);
+    }
+    Some(out.trim_end().to_string())
+}
+
+fn mtime_of(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl Index {
+    pub fn new(worktree: PathBuf, cache_dir: &Path) -> Self {
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            worktree.hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+        Self {
+            worktree,
+            cache_file: cache_dir.join("index").join(format!("{key}.json")),
+            state: Mutex::new(State::default()),
+        }
+    }
+
+    /// Bring the index up to date with the tree; cheap when nothing changed.
+    pub fn refresh(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.loaded {
+            st.loaded = true;
+            if let Ok(text) = std::fs::read_to_string(&self.cache_file)
+                && let Ok(snap) = serde_json::from_str::<Snapshot>(&text)
+            {
+                st.snap = snap;
+            }
+        }
+        if st.last_scan.is_some_and(|t| t.elapsed().as_secs() < REFRESH_SECS) {
+            return;
+        }
+        st.last_scan = Some(Instant::now());
+
+        // walk the tree (gitignore-aware) and find what changed
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut todo: Vec<(String, PathBuf, Lang, u64, u64)> = Vec::new();
+        let walker = ignore::WalkBuilder::new(&self.worktree)
+            .hidden(true)
+            .git_ignore(true)
+            .git_exclude(true)
+            .build();
+        for entry in walker.flatten() {
+            if seen.len() >= MAX_FILES {
+                break;
+            }
+            let path = entry.path();
+            let Some(lang) = lang_of(path) else { continue };
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&self.worktree)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.contains("node_modules/") || rel.contains("/target/") || rel.starts_with("target/") {
+                continue;
+            }
+            seen.insert(rel.clone());
+            let (mtime, len) = (mtime_of(&meta), meta.len());
+            let fresh = st
+                .snap
+                .files
+                .get(&rel)
+                .is_some_and(|e| e.mtime == mtime && e.len == len);
+            if !fresh {
+                todo.push((rel, path.to_path_buf(), lang, mtime, len));
+            }
+        }
+        let removed: Vec<String> = st
+            .snap
+            .files
+            .keys()
+            .filter(|k| !seen.contains(*k))
+            .cloned()
+            .collect();
+        for k in &removed {
+            st.snap.files.remove(k);
+        }
+        let changed = !todo.is_empty() || !removed.is_empty();
+        for (rel, path, lang, mtime, len) in todo {
+            let Ok(src) = std::fs::read(&path) else { continue };
+            let (symbols, idents) = parse_file(lang, &rel, &src);
+            st.snap.files.insert(
+                rel,
+                FileEntry {
+                    mtime,
+                    len,
+                    symbols,
+                    idents,
+                },
+            );
+        }
+        if changed || st.by_name.is_empty() {
+            self.rebuild(&mut st);
+            if changed {
+                let _ = std::fs::create_dir_all(self.cache_file.parent().unwrap_or(Path::new(".")));
+                if let Ok(text) = serde_json::to_string(&st.snap) {
+                    let _ = std::fs::write(&self.cache_file, text);
+                }
+            }
+        }
+    }
+
+    fn rebuild(&self, st: &mut State) {
+        let mut by_name: HashMap<String, Vec<Symbol>> = HashMap::new();
+        for e in st.snap.files.values() {
+            for s in &e.symbols {
+                by_name.entry(s.name.clone()).or_default().push(s.clone());
+            }
+        }
+        let mut refs: HashMap<String, Vec<String>> = HashMap::new();
+        for (file, e) in &st.snap.files {
+            for id in &e.idents {
+                if by_name.contains_key(id) {
+                    refs.entry(id.clone()).or_default().push(file.clone());
+                }
+            }
+        }
+        st.lines = st
+            .snap
+            .files
+            .values()
+            .map(|e| e.len / 40) // rough: avoids re-reading files just to count
+            .sum();
+        st.by_name = by_name;
+        st.refs = refs;
+    }
+
+    pub fn stats(&self) -> (usize, usize) {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (st.snap.files.len(), st.by_name.values().map(Vec::len).sum())
+    }
+
+    /// Definitions of `name` (exact, then case-insensitive).
+    pub fn definitions(&self, name: &str) -> Vec<Symbol> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = st.by_name.get(name) {
+            return v.clone();
+        }
+        let lower = name.to_ascii_lowercase();
+        st.by_name
+            .iter()
+            .filter(|(k, _)| k.to_ascii_lowercase() == lower)
+            .flat_map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    /// Files that mention `name` (excluding where it is defined).
+    pub fn references(&self, name: &str) -> Vec<String> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let defined: HashSet<&str> = st
+            .by_name
+            .get(name)
+            .map(|v| v.iter().map(|s| s.file.as_str()).collect())
+            .unwrap_or_default();
+        let mut out: Vec<String> = st
+            .refs
+            .get(name)
+            .map(|v| {
+                v.iter()
+                    .filter(|f| !defined.contains(f.as_str()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// `refresh` unless another thread is already indexing (then the caller
+    /// uses whatever is there rather than waiting on a cold index).
+    pub fn refresh_if_idle(&self) -> bool {
+        if self.state.try_lock().is_err() {
+            return false;
+        }
+        self.refresh();
+        true
+    }
+
+    /// Symbols whose names appear in `text` (a user prompt), most specific
+    /// first, for the `<symbols>` prompt block; when `skeleton_chars > 0`
+    /// the outline of the file holding most matches follows, if it fits.
+    pub fn relevant(&self, text: &str, max_chars: usize, skeleton_chars: usize) -> String {
+        let words: Vec<String> = text
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| w.len() >= 3 && w.len() <= 80 && !w.chars().all(|c| c.is_ascii_digit()))
+            .map(str::to_string)
+            .collect();
+        if words.is_empty() {
+            return String::new();
+        }
+        // a refresh in progress means a cold index: don't hold the turn for it
+        let Ok(st) = self.state.try_lock() else {
+            return String::new();
+        };
+        if st.by_name.is_empty() {
+            return String::new();
+        }
+        let mut picked: Vec<&Symbol> = Vec::new();
+        let mut seen: HashSet<(String, String, u32)> = HashSet::new();
+        for w in &words {
+            let matches = st.by_name.get(w).or_else(|| {
+                // case/underscore-tolerant lookup, only for words long enough to
+                // be a real identifier (short English words hit too much)
+                if w.len() < 6 {
+                    return None;
+                }
+                let lw = w.to_ascii_lowercase().replace('_', "");
+                st.by_name
+                    .iter()
+                    .find(|(k, _)| k.to_ascii_lowercase().replace('_', "") == lw)
+                    .map(|(_, v)| v)
+            });
+            if let Some(list) = matches {
+                for s in list.iter().take(4) {
+                    if seen.insert((s.file.clone(), s.name.clone(), s.line)) {
+                        picked.push(s);
+                    }
+                }
+            }
+            if picked.len() >= 16 {
+                break;
+            }
+        }
+        if picked.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("<symbols>\n");
+        let mut per_file: HashMap<&str, usize> = HashMap::new();
+        for s in &picked {
+            *per_file.entry(s.file.as_str()).or_default() += 1;
+        }
+        let top_file = per_file
+            .iter()
+            .max_by_key(|(f, n)| (**n, std::cmp::Reverse((*f).to_string())))
+            .map(|(f, _)| f.to_string());
+        for s in picked {
+            let refs = st.refs.get(&s.name).map(|r| r.len()).unwrap_or(0);
+            let line = format!(
+                "{} {} — {}:{}{}\n  {}\n",
+                s.kind,
+                s.name,
+                s.file,
+                s.line,
+                if refs > 1 {
+                    format!(" · used in {refs} files")
+                } else {
+                    String::new()
+                },
+                s.signature
+            );
+            if out.len() + line.len() > max_chars {
+                break;
+            }
+            out.push_str(&line);
+        }
+        out.push_str("</symbols>");
+        if skeleton_chars > 0
+            && let Some(file) = top_file
+            && let Ok(src) = std::fs::read_to_string(self.worktree.join(&file))
+            && let Some(sk) = skeleton(Path::new(&file), &src)
+            && sk.len() <= skeleton_chars
+        {
+            out.push_str(&format!("\n<skeleton file=\"{file}\">\n{sk}\n</skeleton>"));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_rust_and_ts_definitions() {
+        let rs = b"pub struct Config { pub name: String }\nimpl Config {\n    pub fn load(path: &str) -> Config { todo!() }\n}\nfn helper() {}\n";
+        let (syms, idents) = parse_file(Lang::Rust, "src/config.rs", rs);
+        let names: Vec<(&str, &str)> = syms.iter().map(|s| (s.kind.as_str(), s.name.as_str())).collect();
+        assert!(names.contains(&("struct", "Config")));
+        assert!(names.contains(&("impl", "Config")));
+        assert!(names.contains(&("fn", "load")));
+        assert!(names.contains(&("fn", "helper")));
+        assert!(idents.iter().any(|i| i == "Config"));
+        let load = syms.iter().find(|s| s.name == "load").unwrap();
+        assert_eq!(load.line, 3);
+        assert_eq!(load.signature, "pub fn load(path: &str) -> Config");
+
+        let ts = b"export interface User { id: string }\nexport const fetchUser = async (id: string) => { return id }\nclass Repo {\n  find(id: string) { return id }\n}\nconst N = 3;\n";
+        let (syms, _) = parse_file(Lang::TypeScript, "src/user.ts", ts);
+        let names: Vec<(&str, &str)> = syms.iter().map(|s| (s.kind.as_str(), s.name.as_str())).collect();
+        assert!(names.contains(&("interface", "User")));
+        assert!(names.contains(&("const", "fetchUser")));
+        assert!(names.contains(&("class", "Repo")));
+        assert!(names.contains(&("method", "find")));
+        assert!(!names.iter().any(|(_, n)| *n == "N"), "{names:?}");
+    }
+
+    #[test]
+    fn skeleton_elides_bodies_keeps_types() {
+        let src = "/// Config of the app.\npub struct Config {\n    pub name: String,\n    pub retries: u32,\n}\n\nimpl Config {\n    /// Load it.\n    pub fn load(path: &str) -> Config {\n        let text = std::fs::read_to_string(path).unwrap();\n        parse(&text)\n    }\n}\n\nfn parse(t: &str) -> Config {\n    todo!()\n}\n";
+        let sk = skeleton(Path::new("a.rs"), src).unwrap();
+        assert!(sk.contains("pub name: String"), "{sk}");
+        assert!(sk.contains("/// Load it."), "{sk}");
+        assert!(
+            sk.contains("pub fn load(path: &str) -> Config { … } // 3 lines"),
+            "{sk}"
+        );
+        assert!(!sk.contains("read_to_string"), "{sk}");
+        assert!(sk.contains("    9\t    pub fn load"), "{sk}");
+        // the line after the elided body keeps its original number
+        assert!(sk.contains("   13\t}"), "{sk}");
+        assert!(
+            sk.contains("   15\tfn parse(t: &str) -> Config { … } // 2 lines"),
+            "{sk}"
+        );
+        let py =
+            "class A:\n    def run(self, x):\n        y = x + 1\n        return y\n\ndef top():\n    pass\n";
+        let sk = skeleton(Path::new("a.py"), py).unwrap();
+        assert!(
+            sk.contains("    2\t    def run(self, x):\n    3\t        … # 2 lines\n    5\t"),
+            "{sk}"
+        );
+        assert!(!sk.contains("y = x + 1"));
+    }
+
+    #[test]
+    fn extracts_java_c_cpp_ruby() {
+        let java = b"public class Repo {\n  private int n;\n  public User find(String id) {\n    return null;\n  }\n}\ninterface Store {}\n";
+        let (syms, _) = parse_file(Lang::Java, "Repo.java", java);
+        let names: Vec<(&str, &str)> = syms.iter().map(|s| (s.kind.as_str(), s.name.as_str())).collect();
+        assert!(
+            names.contains(&("class", "Repo"))
+                && names.contains(&("method", "find"))
+                && names.contains(&("interface", "Store")),
+            "{names:?}"
+        );
+        let c = b"struct point { int x; };\nstatic int add(int a, int b) {\n  return a + b;\n}\ntypedef struct point point_t;\n";
+        let (syms, _) = parse_file(Lang::C, "p.c", c);
+        let names: Vec<(&str, &str)> = syms.iter().map(|s| (s.kind.as_str(), s.name.as_str())).collect();
+        assert!(
+            names.contains(&("struct", "point")) && names.contains(&("fn", "add")),
+            "{names:?}"
+        );
+        let cpp = b"namespace geo {\nclass Shape {\n public:\n  virtual double area() const;\n};\ndouble Shape::area() const { return 0; }\n}\n";
+        let (syms, _) = parse_file(Lang::Cpp, "s.cpp", cpp);
+        let names: Vec<(&str, &str)> = syms.iter().map(|s| (s.kind.as_str(), s.name.as_str())).collect();
+        assert!(
+            names.contains(&("mod", "geo")) && names.contains(&("class", "Shape")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|(k, n)| *k == "fn" && n.contains("area")),
+            "{names:?}"
+        );
+        let rb = b"module Billing\n  class Invoice\n    def total\n      t = 0\n      lines.each { |l| t += l }\n      t\n    end\n    def self.build(x)\n      new\n    end\n  end\nend\n";
+        let (syms, _) = parse_file(Lang::Ruby, "i.rb", rb);
+        let names: Vec<(&str, &str)> = syms.iter().map(|s| (s.kind.as_str(), s.name.as_str())).collect();
+        assert!(
+            names.contains(&("mod", "Billing"))
+                && names.contains(&("class", "Invoice"))
+                && names.contains(&("method", "total"))
+                && names.contains(&("method", "build")),
+            "{names:?}"
+        );
+        let sk = skeleton(Path::new("p.c"), std::str::from_utf8(c).unwrap()).unwrap();
+        assert!(
+            sk.contains("static int add(int a, int b) { … } // 2 lines"),
+            "{sk}"
+        );
+        assert!(sk.contains("struct point { int x; };"));
+        let sk = skeleton(Path::new("i.rb"), std::str::from_utf8(rb).unwrap()).unwrap();
+        assert!(sk.contains("def total"), "{sk}");
+        assert!(!sk.contains("lines.each"), "{sk}");
+    }
+
+    #[test]
+    fn index_refresh_and_relevance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn render_matrix(rows: usize) -> String { String::new() }\npub struct Matrix;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() { let _ = crate::render_matrix(3); }\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let idx = Index::new(dir.path().to_path_buf(), cache.path());
+        idx.refresh();
+        assert_eq!(idx.stats().0, 2);
+        assert_eq!(idx.definitions("render_matrix").len(), 1);
+        assert_eq!(idx.references("render_matrix"), vec!["src/main.rs".to_string()]);
+        let block = idx.relevant("please make the matrix export use render_matrix", 800, 2000);
+        assert!(block.contains("<skeleton file=\"src/lib.rs\">"), "{block}");
+        assert!(block.contains("fn render_matrix — src/lib.rs:1"), "{block}");
+        assert!(block.contains("struct Matrix"), "{block}");
+        assert!(idx.relevant("hello there", 800, 2000).is_empty());
+        // a fresh Index instance loads the cache and sees no changes
+        let again = Index::new(dir.path().to_path_buf(), cache.path());
+        again.refresh();
+        assert_eq!(again.stats(), idx.stats());
+    }
+}
