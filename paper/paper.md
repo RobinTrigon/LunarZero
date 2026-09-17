@@ -7,12 +7,12 @@ tags:
   - developer tools
   - model routing
 authors:
-  - name: Aifee Aadil
+  - name: Ariful Islam
     orcid: 0000-0000-0000-0000
     corresponding: true
     affiliation: 1
 affiliations:
-  - name: Independent Researcher, Bangladesh
+  - name: Daffodil International University, Ashulia, Dhaka, Bangladesh
     index: 1
 date: 18 September 2026
 bibliography: paper.bib
